@@ -57,6 +57,12 @@ const (
 	nFilter   = 5
 )
 
+// Interlace method, as per PNG spec.
+const (
+	imNone  = 0
+	imAdam7 = 1
+)
+
 // Decoding stage.
 // The PNG specification says that the IHDR, PLTE (if present), IDAT and IEND
 // chunks must appear in that order. There may be multiple IDAT chunks, and
@@ -74,16 +80,17 @@ const (
 const pngHeader = "\x89PNG\r\n\x1a\n"
 
 type decoder struct {
-	r             io.Reader
-	img           image.Image
-	crc           hash.Hash32
-	width, height int
-	depth         int
-	palette       color.Palette
-	cb            int
-	stage         int
-	idatLength    uint32
-	tmp           [3 * 256]byte
+	r               io.Reader
+	img             image.Image
+	crc             hash.Hash32
+	width, height   int
+	depth           int
+	palette         color.Palette
+	cb              int
+	interlaceMethod int
+	stage           int
+	idatLength      uint32
+	tmp             [3 * 256]byte
 }
 
 // A FormatError reports that the input is not a valid PNG.
@@ -113,9 +120,10 @@ func (d *decoder) parseIHDR(length uint32) error {
 		return err
 	}
 	d.crc.Write(d.tmp[:13])
-	if d.tmp[10] != 0 || d.tmp[11] != 0 || d.tmp[12] != 0 {
+	if d.tmp[10] != 0 || d.tmp[11] != 0 || (d.tmp[12] < imNone || d.tmp[12] > imAdam7) {
 		return UnsupportedError("compression, filter or interlace method")
 	}
+	d.interlaceMethod = int(d.tmp[12])
 	w := int32(binary.BigEndian.Uint32(d.tmp[0:4]))
 	h := int32(binary.BigEndian.Uint32(d.tmp[4:8]))
 	if w < 0 || h < 0 {
@@ -339,169 +347,214 @@ func (d *decoder) decode() (image.Image, error) {
 	}
 	bytesPerPixel := (bitsPerPixel + 7) / 8
 
-	// cr and pr are the bytes for the current and previous row.
-	// The +1 is for the per-row filter type, which is at cr[0].
-	cr := make([]uint8, 1+(bitsPerPixel*d.width+7)/8)
-	pr := make([]uint8, 1+(bitsPerPixel*d.width+7)/8)
+	var (
+		passCount              int
+		rowOffsets, colOffsets []int
+		rowStrides, colStrides     []int
+	)
 
-	for y := 0; y < d.height; y++ {
-		// Read the decompressed bytes.
-		_, err := io.ReadFull(r, cr)
-		if err != nil {
-			return nil, err
+	switch d.interlaceMethod {
+	case imNone:
+		passCount = 1
+		rowOffsets = []int{0}
+		colOffsets = []int{0}
+		rowStrides = []int{1}
+		colStrides = []int{1}
+	case imAdam7:
+		passCount = 7
+		rowOffsets = []int{0, 0, 4, 0, 2, 0, 1}
+		colOffsets = []int{0, 4, 0, 2, 0, 1, 0}
+		rowStrides = []int{8, 8, 8, 4, 4, 2, 2}
+		colStrides = []int{8, 8, 4, 4, 2, 2, 1}
+	}
+
+	var (
+		cr, pr []uint8
+	)
+	for pass := 0; pass < passCount; pass++ {
+		// pass x/y offsets
+		pxo := colOffsets[pass]
+		pyo := rowOffsets[pass]
+		// pass x/y strides
+		pxs := colStrides[pass]
+		pys := rowStrides[pass]
+
+		passHeight := d.height / pxs
+		passWidth := d.width / pys 
+
+		// cr and pr are the bytes for the current and previous row.
+		// The +1 is for the per-row filter type, which is at cr[0].
+		cr = make([]uint8, 1+(bitsPerPixel*passWidth+7)/8)
+		pr = make([]uint8, 1+(bitsPerPixel*passWidth+7)/8)
+
+		for y := 0; y < passHeight; y++ {
+			// Read the decompressed bytes.
+			_, err := io.ReadFull(r, cr)
+			if err != nil {
+				return nil, err
+			}
+
+			// Apply the filter.
+			cdat := cr[1:]
+			pdat := pr[1:]
+			switch cr[0] {
+			case ftNone:
+				// No-op.
+			case ftSub:
+				for i := bytesPerPixel; i < len(cdat); i++ {
+					cdat[i] += cdat[i-bytesPerPixel]
+				}
+			case ftUp:
+				for i, p := range pdat {
+					cdat[i] += p
+				}
+			case ftAverage:
+				for i := 0; i < bytesPerPixel; i++ {
+					cdat[i] += pdat[i] / 2
+				}
+				for i := bytesPerPixel; i < len(cdat); i++ {
+					cdat[i] += uint8((int(cdat[i-bytesPerPixel]) + int(pdat[i])) / 2)
+				}
+			case ftPaeth:
+				filterPaeth(cdat, pdat, bytesPerPixel)
+			default:
+				return nil, FormatError("bad filter type")
+			}
+
+			// Convert from bytes to colors.
+			switch d.cb {
+			case cbG1:
+				for x := 0; x < passWidth; x += 8 {
+					b := cdat[x/8]
+					for x2 := 0; x2 < 8 && x+x2 < passWidth; x2++ {
+						gray.SetGray(((x+x2)*pxs)+pxo, (y*pys)+pyo, color.Gray{(b >> 7) * 0xff})
+						b <<= 1
+					}
+				}
+			case cbG2:
+				for x := 0; x < passWidth; x += 4 {
+					b := cdat[x/4]
+					for x2 := 0; x2 < 4 && x+x2 < passWidth; x2++ {
+						gray.SetGray(((x+x2)*pxs)+pxo, (y*pys)+pyo, color.Gray{(b >> 6) * 0x55})
+						b <<= 2
+					}
+				}
+			case cbG4:
+				for x := 0; x < passWidth; x += 2 {
+					b := cdat[x/2]
+					for x2 := 0; x2 < 2 && x+x2 < passWidth; x2++ {
+						gray.SetGray(((x+x2)*pxs)+pxo, (y*pys)+pyo, color.Gray{(b >> 4) * 0x11})
+						b <<= 4
+					}
+				}
+			case cbG8:
+				for x := 0; x < passWidth; x++ {
+					i := (gray.Stride * ((y * pys) + pyo)) + pxo
+					gray.Pix[i] = cdat[x]
+				}
+			case cbGA8:
+				for x := 0; x < passWidth; x++ {
+					ycol := cdat[2*x+0]
+					nrgba.SetNRGBA((x*pxs)+pxo, (y*pys)+pyo, color.NRGBA{ycol, ycol, ycol, cdat[2*x+1]})
+				}
+			case cbTC8:
+				pix, i, j := rgba.Pix, pixOffset, 0
+				i = (rgba.Stride * (pyo + (pys * y))) + (pxo * 4)
+				for x := 0; x < passWidth; x++ {
+					pix[i+0] = cdat[j+0]
+					pix[i+1] = cdat[j+1]
+					pix[i+2] = cdat[j+2]
+					pix[i+3] = 0xff
+					i += (pxs * 4)
+					j += 3
+				}
+				pixOffset += rgba.Stride
+			case cbP1:
+				for x := 0; x < passWidth; x += 8 {
+					b := cdat[x/8]
+					for x2 := 0; x2 < 8 && x+x2 < passWidth; x2++ {
+						idx := b >> 7
+						if len(paletted.Palette) <= int(idx) {
+							paletted.Palette = paletted.Palette[:int(idx)+1]
+						}
+						paletted.SetColorIndex(((x+x2)*pxs)+pxo, (y*pys)+pyo, idx)
+						b <<= 1
+					}
+				}
+			case cbP2:
+				for x := 0; x < passWidth; x += 4 {
+					b := cdat[x/4]
+					for x2 := 0; x2 < 4 && x+x2 < passWidth; x2++ {
+						idx := b >> 6
+						if len(paletted.Palette) <= int(idx) {
+							paletted.Palette = paletted.Palette[:int(idx)+1]
+						}
+						paletted.SetColorIndex(((x+x2)*pxs)+pxo, (y*pys)+pyo, idx)
+						b <<= 2
+					}
+				}
+			case cbP4:
+				for x := 0; x < passWidth; x += 2 {
+					b := cdat[x/2]
+					for x2 := 0; x2 < 2 && x+x2 < passWidth; x2++ {
+						idx := b >> 4
+						if len(paletted.Palette) <= int(idx) {
+							paletted.Palette = paletted.Palette[:int(idx)+1]
+						}
+						paletted.SetColorIndex(((x+x2)*pxs)+pxo, (y*pys)+pyo, idx)
+						b <<= 4
+					}
+				}
+			case cbP8:
+				if len(paletted.Palette) != 255 {
+					for x := 0; x < passWidth; x++ {
+						if len(paletted.Palette) <= int(cdat[x]) {
+							paletted.Palette = paletted.Palette[:int(cdat[x])+1]
+						}
+					}
+				}
+				for x := 0; x < passWidth; x++ {
+					paletted.SetColorIndex((x*pxs)+pxo, (y*pys)+pyo, cdat[x])
+				}
+			case cbTCA8:
+				for x := 0; x < passWidth; x++ {
+					rcol := cdat[4*x+0]
+					gcol := cdat[4*x+1]
+					bcol := cdat[4*x+2]
+					acol := cdat[4*x+3]
+					nrgba.SetNRGBA((x*pxs)+pxo, (y*pys)+pyo, color.NRGBA{rcol, gcol, bcol, acol})
+				}
+			case cbG16:
+				for x := 0; x < passWidth; x++ {
+					ycol := uint16(cdat[2*x+0])<<8 | uint16(cdat[2*x+1])
+					gray16.SetGray16((x*pxs)+pxo, (y*pys)+pyo, color.Gray16{ycol})
+				}
+			case cbGA16:
+				for x := 0; x < passWidth; x++ {
+					ycol := uint16(cdat[4*x+0])<<8 | uint16(cdat[4*x+1])
+					acol := uint16(cdat[4*x+2])<<8 | uint16(cdat[4*x+3])
+					nrgba64.SetNRGBA64((x*pxs)+pxo, (y*pys)+pyo, color.NRGBA64{ycol, ycol, ycol, acol})
+				}
+			case cbTC16:
+				for x := 0; x < passWidth; x++ {
+					rcol := uint16(cdat[6*x+0])<<8 | uint16(cdat[6*x+1])
+					gcol := uint16(cdat[6*x+2])<<8 | uint16(cdat[6*x+3])
+					bcol := uint16(cdat[6*x+4])<<8 | uint16(cdat[6*x+5])
+					rgba64.SetRGBA64((x*pxs)+pxo, (y*pys)+pyo, color.RGBA64{rcol, gcol, bcol, 0xffff})
+				}
+			case cbTCA16:
+				for x := 0; x < passWidth; x++ {
+					rcol := uint16(cdat[8*x+0])<<8 | uint16(cdat[8*x+1])
+					gcol := uint16(cdat[8*x+2])<<8 | uint16(cdat[8*x+3])
+					bcol := uint16(cdat[8*x+4])<<8 | uint16(cdat[8*x+5])
+					acol := uint16(cdat[8*x+6])<<8 | uint16(cdat[8*x+7])
+					nrgba64.SetNRGBA64((x*pxs)+pxo, (y*pys)+pyo, color.NRGBA64{rcol, gcol, bcol, acol})
+				}
+			}
+
+			// The current row for y is the previous row for y+1.
+			pr, cr = cr, pr
 		}
-
-		// Apply the filter.
-		cdat := cr[1:]
-		pdat := pr[1:]
-		switch cr[0] {
-		case ftNone:
-			// No-op.
-		case ftSub:
-			for i := bytesPerPixel; i < len(cdat); i++ {
-				cdat[i] += cdat[i-bytesPerPixel]
-			}
-		case ftUp:
-			for i, p := range pdat {
-				cdat[i] += p
-			}
-		case ftAverage:
-			for i := 0; i < bytesPerPixel; i++ {
-				cdat[i] += pdat[i] / 2
-			}
-			for i := bytesPerPixel; i < len(cdat); i++ {
-				cdat[i] += uint8((int(cdat[i-bytesPerPixel]) + int(pdat[i])) / 2)
-			}
-		case ftPaeth:
-			filterPaeth(cdat, pdat, bytesPerPixel)
-		default:
-			return nil, FormatError("bad filter type")
-		}
-
-		// Convert from bytes to colors.
-		switch d.cb {
-		case cbG1:
-			for x := 0; x < d.width; x += 8 {
-				b := cdat[x/8]
-				for x2 := 0; x2 < 8 && x+x2 < d.width; x2++ {
-					gray.SetGray(x+x2, y, color.Gray{(b >> 7) * 0xff})
-					b <<= 1
-				}
-			}
-		case cbG2:
-			for x := 0; x < d.width; x += 4 {
-				b := cdat[x/4]
-				for x2 := 0; x2 < 4 && x+x2 < d.width; x2++ {
-					gray.SetGray(x+x2, y, color.Gray{(b >> 6) * 0x55})
-					b <<= 2
-				}
-			}
-		case cbG4:
-			for x := 0; x < d.width; x += 2 {
-				b := cdat[x/2]
-				for x2 := 0; x2 < 2 && x+x2 < d.width; x2++ {
-					gray.SetGray(x+x2, y, color.Gray{(b >> 4) * 0x11})
-					b <<= 4
-				}
-			}
-		case cbG8:
-			copy(gray.Pix[pixOffset:], cdat)
-			pixOffset += gray.Stride
-		case cbGA8:
-			for x := 0; x < d.width; x++ {
-				ycol := cdat[2*x+0]
-				nrgba.SetNRGBA(x, y, color.NRGBA{ycol, ycol, ycol, cdat[2*x+1]})
-			}
-		case cbTC8:
-			pix, i, j := rgba.Pix, pixOffset, 0
-			for x := 0; x < d.width; x++ {
-				pix[i+0] = cdat[j+0]
-				pix[i+1] = cdat[j+1]
-				pix[i+2] = cdat[j+2]
-				pix[i+3] = 0xff
-				i += 4
-				j += 3
-			}
-			pixOffset += rgba.Stride
-		case cbP1:
-			for x := 0; x < d.width; x += 8 {
-				b := cdat[x/8]
-				for x2 := 0; x2 < 8 && x+x2 < d.width; x2++ {
-					idx := b >> 7
-					if len(paletted.Palette) <= int(idx) {
-						paletted.Palette = paletted.Palette[:int(idx)+1]
-					}
-					paletted.SetColorIndex(x+x2, y, idx)
-					b <<= 1
-				}
-			}
-		case cbP2:
-			for x := 0; x < d.width; x += 4 {
-				b := cdat[x/4]
-				for x2 := 0; x2 < 4 && x+x2 < d.width; x2++ {
-					idx := b >> 6
-					if len(paletted.Palette) <= int(idx) {
-						paletted.Palette = paletted.Palette[:int(idx)+1]
-					}
-					paletted.SetColorIndex(x+x2, y, idx)
-					b <<= 2
-				}
-			}
-		case cbP4:
-			for x := 0; x < d.width; x += 2 {
-				b := cdat[x/2]
-				for x2 := 0; x2 < 2 && x+x2 < d.width; x2++ {
-					idx := b >> 4
-					if len(paletted.Palette) <= int(idx) {
-						paletted.Palette = paletted.Palette[:int(idx)+1]
-					}
-					paletted.SetColorIndex(x+x2, y, idx)
-					b <<= 4
-				}
-			}
-		case cbP8:
-			if len(paletted.Palette) != 255 {
-				for x := 0; x < d.width; x++ {
-					if len(paletted.Palette) <= int(cdat[x]) {
-						paletted.Palette = paletted.Palette[:int(cdat[x])+1]
-					}
-				}
-			}
-			copy(paletted.Pix[pixOffset:], cdat)
-			pixOffset += paletted.Stride
-		case cbTCA8:
-			copy(nrgba.Pix[pixOffset:], cdat)
-			pixOffset += nrgba.Stride
-		case cbG16:
-			for x := 0; x < d.width; x++ {
-				ycol := uint16(cdat[2*x+0])<<8 | uint16(cdat[2*x+1])
-				gray16.SetGray16(x, y, color.Gray16{ycol})
-			}
-		case cbGA16:
-			for x := 0; x < d.width; x++ {
-				ycol := uint16(cdat[4*x+0])<<8 | uint16(cdat[4*x+1])
-				acol := uint16(cdat[4*x+2])<<8 | uint16(cdat[4*x+3])
-				nrgba64.SetNRGBA64(x, y, color.NRGBA64{ycol, ycol, ycol, acol})
-			}
-		case cbTC16:
-			for x := 0; x < d.width; x++ {
-				rcol := uint16(cdat[6*x+0])<<8 | uint16(cdat[6*x+1])
-				gcol := uint16(cdat[6*x+2])<<8 | uint16(cdat[6*x+3])
-				bcol := uint16(cdat[6*x+4])<<8 | uint16(cdat[6*x+5])
-				rgba64.SetRGBA64(x, y, color.RGBA64{rcol, gcol, bcol, 0xffff})
-			}
-		case cbTCA16:
-			for x := 0; x < d.width; x++ {
-				rcol := uint16(cdat[8*x+0])<<8 | uint16(cdat[8*x+1])
-				gcol := uint16(cdat[8*x+2])<<8 | uint16(cdat[8*x+3])
-				bcol := uint16(cdat[8*x+4])<<8 | uint16(cdat[8*x+5])
-				acol := uint16(cdat[8*x+6])<<8 | uint16(cdat[8*x+7])
-				nrgba64.SetNRGBA64(x, y, color.NRGBA64{rcol, gcol, bcol, acol})
-			}
-		}
-
-		// The current row for y is the previous row for y+1.
-		pr, cr = cr, pr
 	}
 
 	// Check for EOF, to verify the zlib checksum.
