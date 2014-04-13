@@ -379,8 +379,15 @@ func (d *decoder) decode() (image.Image, error) {
 		pxs := colStrides[pass]
 		pys := rowStrides[pass]
 
-		passHeight := d.height / pys
-		passWidth := d.width / pxs
+		passWidth := (d.width - pxo) / pxs
+		passHeight := (d.height - pyo) / pys
+
+		if ((d.width - pxo) % pxs) != 0 {
+			passWidth++
+		}
+		if ((d.height - pyo) % pys) != 0 {
+			passHeight++
+		}
 
 		// cr and pr are the bytes for the current and previous row.
 		// The +1 is for the per-row filter type, which is at cr[0].

@@ -37,11 +37,11 @@ var filenames = []string{
 	"basn6a08",
 	"basn6a16",
 	"basi0g01",
-	//"basi0g01-30",
+	"basi0g01-30",
 	"basi0g02",
-	//"basi0g02-29",
+	"basi0g02-29",
 	"basi0g04",
-	//"basi0g04-31",
+	"basi0g04-31",
 	"basi0g08",
 	"basi0g16",
 	"basi2c08",
@@ -75,7 +75,7 @@ var filenamesShort = []string{
 	"basn0g04-31",
 	"basn6a16",
 	"basi0g01",
-	//"basi0g04-31",
+	"basi0g04-31",
 	"basi6a16",
 }
 
