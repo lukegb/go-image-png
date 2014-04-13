@@ -449,7 +449,7 @@ func (d *decoder) decode() (image.Image, error) {
 				}
 			case cbG8:
 				for x := 0; x < passWidth; x++ {
-					i := (gray.Stride * ((y * pys) + pyo)) + pxo
+					i := (gray.Stride * ((y * pys) + pyo)) + ((x * pxs) + pxo)
 					gray.Pix[i] = cdat[x]
 				}
 			case cbGA8:
