@@ -350,7 +350,7 @@ func (d *decoder) decode() (image.Image, error) {
 	var (
 		passCount              int
 		rowOffsets, colOffsets []int
-		rowStrides, colStrides     []int
+		rowStrides, colStrides []int
 	)
 
 	switch d.interlaceMethod {
@@ -379,8 +379,8 @@ func (d *decoder) decode() (image.Image, error) {
 		pxs := colStrides[pass]
 		pys := rowStrides[pass]
 
-		passHeight := d.height / pxs
-		passWidth := d.width / pys 
+		passHeight := d.height / pys
+		passWidth := d.width / pxs
 
 		// cr and pr are the bytes for the current and previous row.
 		// The +1 is for the per-row filter type, which is at cr[0].

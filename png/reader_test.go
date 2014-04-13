@@ -36,6 +36,25 @@ var filenames = []string{
 	"basn4a16",
 	"basn6a08",
 	"basn6a16",
+	"basi0g01",
+	//"basi0g01-30",
+	"basi0g02",
+	//"basi0g02-29",
+	"basi0g04",
+	//"basi0g04-31",
+	"basi0g08",
+	"basi0g16",
+	"basi2c08",
+	"basi2c16",
+	"basi3p01",
+	"basi3p02",
+	"basi3p04",
+	"basi3p08",
+	//"basi3p08-trns",
+	"basi4a08",
+	"basi4a16",
+	"basi6a08",
+	"basi6a16",
 }
 
 var filenamesPaletted = []string{
@@ -44,12 +63,20 @@ var filenamesPaletted = []string{
 	"basn3p04",
 	"basn3p08",
 	"basn3p08-trns",
+	"basi3p01",
+	"basi3p02",
+	"basi3p04",
+	"basi3p08",
+	//"basi3p08-trns",
 }
 
 var filenamesShort = []string{
 	"basn0g01",
 	"basn0g04-31",
 	"basn6a16",
+	"basi0g01",
+	//"basi0g04-31",
+	"basi6a16",
 }
 
 func readPNG(filename string) (image.Image, error) {
